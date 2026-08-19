@@ -1,4 +1,4 @@
-const { describe, test } = require("node:test");
+const { after, describe, test } = require("node:test");
 const assert = require("node:assert");
 const grpc = require("@grpc/grpc-js");
 const protoLoader = require("@grpc/proto-loader");
@@ -25,18 +25,18 @@ message EchoResponse {
 }
 `;
 
+// Proto content is constant, so write it once for the whole file
+const protoDir = fs.mkdtempSync(path.join(os.tmpdir(), "uptime-kuma-grpc-"));
+const protoPath = path.join(protoDir, "test.proto");
+fs.writeFileSync(protoPath, testProto);
+after(() => fs.rmSync(protoDir, { recursive: true, force: true }));
+
 /**
  * Create a gRPC server for testing
- * @param {number} port Port to listen on
  * @param {object} methodHandlers Object with method handlers
- * @returns {Promise<grpc.Server>} gRPC server instance
+ * @returns {Promise<{server: grpc.Server, port: number}>} gRPC server instance and the port it bound to
  */
-async function createTestGrpcServer(port, methodHandlers) {
-    // Write proto to temp file
-    const tmpDir = os.tmpdir();
-    const protoPath = path.join(tmpDir, `test-${port}.proto`);
-    fs.writeFileSync(protoPath, testProto);
-
+async function createTestGrpcServer(methodHandlers) {
     // Load proto file
     const packageDefinition = protoLoader.loadSync(protoPath, {
         keepCase: true,
@@ -62,14 +62,14 @@ async function createTestGrpcServer(port, methodHandlers) {
     });
 
     return new Promise((resolve, reject) => {
-        server.bindAsync(`0.0.0.0:${port}`, grpc.ServerCredentials.createInsecure(), (err) => {
+        // Bind to port 0 so the OS picks a free port, fixed ports inside the ephemeral
+        // range collide with other test files running in parallel under `node --test`
+        server.bindAsync("0.0.0.0:0", grpc.ServerCredentials.createInsecure(), (err, port) => {
             if (err) {
                 reject(err);
             } else {
                 server.start();
-                // Clean up temp file
-                fs.unlinkSync(protoPath);
-                resolve(server);
+                resolve({ server, port });
             }
         });
     });
@@ -82,8 +82,7 @@ describe(
     },
     () => {
         test("check() sets status to UP when keyword is found in response", async () => {
-            const port = 50051;
-            const server = await createTestGrpcServer(port, {
+            const { server, port } = await createTestGrpcServer({
                 Echo: (call, callback) => {
                     callback(null, { message: "Hello World with SUCCESS keyword" });
                 },
@@ -118,8 +117,7 @@ describe(
         });
 
         test("check() rejects when keyword is not found in response", async () => {
-            const port = 50052;
-            const server = await createTestGrpcServer(port, {
+            const { server, port } = await createTestGrpcServer({
                 Echo: (call, callback) => {
                     callback(null, { message: "Hello World without the expected keyword" });
                 },
@@ -155,8 +153,7 @@ describe(
         });
 
         test("check() rejects when inverted keyword is present in response", async () => {
-            const port = 50053;
-            const server = await createTestGrpcServer(port, {
+            const { server, port } = await createTestGrpcServer({
                 Echo: (call, callback) => {
                     callback(null, { message: "Response with ERROR keyword" });
                 },
@@ -192,8 +189,7 @@ describe(
         });
 
         test("check() sets status to UP when inverted keyword is not present in response", async () => {
-            const port = 50054;
-            const server = await createTestGrpcServer(port, {
+            const { server, port } = await createTestGrpcServer({
                 Echo: (call, callback) => {
                     callback(null, { message: "Response without error keyword" });
                 },
@@ -253,10 +249,9 @@ describe(
         });
 
         test("check() truncates long response messages in error output", async () => {
-            const port = 50055;
             const longMessage = "A".repeat(100) + " with SUCCESS keyword";
 
-            const server = await createTestGrpcServer(port, {
+            const { server, port } = await createTestGrpcServer({
                 Echo: (call, callback) => {
                     callback(null, { message: longMessage });
                 },
